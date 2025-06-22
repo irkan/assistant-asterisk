@@ -1,0 +1,600 @@
+const ariClient = require('ari-client');
+const path = require('path');
+const fs = require('fs');
+const fsPromises = fs.promises;
+const { exec, spawn, execSync } = require('child_process');
+const dgram = require('dgram');
+const WebSocket = require('ws');
+
+// -------- TIMESTAMP LOGS --------
+['log', 'warn', 'error'].forEach(method => {
+  const original = console[method];
+  console[method] = (...args) => {
+    const timestamp = new Date().toISOString();
+    original(`[${timestamp}]`, ...args);
+  };
+});
+// ------------------------------
+
+// -------- TƏNZİMLƏMƏLƏR (DİQQƏT!) --------
+const ASTERISK_URL = 'http://localhost:8088';
+const ASTERISK_USERNAME = 'voicebot_user';         // Addım 1.2-də yaratdığınız istifadəçi adı
+const ASTERISK_PASSWORD = 'SuperGucluParol123';    // Addım 1.2-də təyin etdiyiniz parol
+const ARI_APP_NAME = 'voicebot_app';               // Addım 1.3-də istifadə etdiyiniz ad
+const WEBSOCKET_URL = 'ws://localhost:3001';   // Qoşulacağımız WebSocket serveri
+const BASE_UDP_PORT = 10000;                       // Səs axını üçün istifadə ediləcək başlanğıc UDP portu
+
+const SOUNDS_DIR = path.join(__dirname, 'sounds');
+const RECORDINGS_DIR = path.join(__dirname, 'recordings');
+
+// Səsləri hazırlayan funksiya
+function setupSounds() {
+    if (!fs.existsSync(SOUNDS_DIR)) {
+        fs.mkdirSync(SOUNDS_DIR, { recursive: true });
+        console.log(`Səslər üçün qovluq yaradıldı: ${SOUNDS_DIR}`);
+    }
+    // chown əmri üçün xəbərdarlıq və təlimat
+    console.log(`Asterisk istifadəçisinin "${SOUNDS_DIR}" qovluğuna yazma və oxuma icazəsi olduğundan əmin olun.`);
+    exec(`chown -R asterisk:asterisk ${SOUNDS_DIR}`, (err) => {
+        if (err) {
+            console.warn(`⚠️  'chown' əmri uğursuz oldu. Səs fayllarını yaratmaq/oxumaq üçün Asterisk-in icazəsi olmaya bilər. Detallar: ${err.message}`);
+        } else {
+            console.log(`✅  '${SOUNDS_DIR}' qovluğunun sahibi 'asterisk:asterisk' olaraq təyin edildi.`);
+        }
+    });
+}
+
+// Səs yazılarını saxlamaq üçün qovluq yaradan funksiya
+function setupRecordings() {
+    if (!fs.existsSync(RECORDINGS_DIR)) {
+        fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
+        console.log(`Səs yazıları üçün qovluq yaradıldı: ${RECORDINGS_DIR}`);
+    }
+}
+
+// Toplanmış səs parçalarını .wav faylı kimi saxlayan funksiya
+async function saveIncomingRecording(channelId, audioChunks) {
+    if (!audioChunks || audioChunks.length === 0) {
+        console.log(`[${channelId}] [INCOMING] Yazmaq üçün səs datası tapılmadı.`);
+        return;
+    }
+
+    console.log(`[${channelId}] [INCOMING] Gələn səs yazısı yaddaşa verilir... Toplam ${audioChunks.length} parça.`);
+    
+    try {
+        const fullAudio = Buffer.concat(audioChunks);
+        console.log(`[${channelId}] [INCOMING] Toplam səs ölçüsü: ${fullAudio.length} bayt`);
+        
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const wavFileName = `${channelId}_INCOMING_${timestamp}.wav`;
+        const rawFilePath = path.join(RECORDINGS_DIR, `${wavFileName}.raw`);
+        const wavFilePath = path.join(RECORDINGS_DIR, wavFileName);
+
+        // 1. Xam ulaw faylını yazırıq
+        await fsPromises.writeFile(rawFilePath, fullAudio);
+        console.log(`[${channelId}] [INCOMING] Müvəqqəti xam fayl yazıldı: ${rawFilePath} (${fullAudio.length} bayt)`);
+
+        // 2. sox ilə WAV formatına çeviririk (ulaw 8kHz -> WAV)
+        const soxCommand = `sox -t ul -r 8000 -c 1 "${rawFilePath}" "${wavFilePath}"`;
+        console.log(`[${channelId}] [INCOMING] Sox əmri icra edilir: ${soxCommand}`);
+        
+        await new Promise((resolve, reject) => {
+            exec(soxCommand, (error, stdout, stderr) => {
+                if (error) {
+                    console.error(`[${channelId}] [INCOMING] sox konvertasiya xətası: ${stderr}`);
+                    fsPromises.unlink(rawFilePath).catch(e => console.error(`[${channelId}] [INCOMING] Müvəqqəti faylı silərkən xəta: ${e.message}`));
+                    return reject(error);
+                }
+                console.log(`[${channelId}] [INCOMING] ✅ Gələn səs yazısı uğurla WAV formatına çevrildi: ${wavFilePath}`);
+                if (stdout) console.log(`[${channelId}] [INCOMING] Sox stdout: ${stdout}`);
+                resolve(stdout);
+            });
+        });
+
+        // 3. Müvəqqəti xam faylı silirik
+        await fsPromises.unlink(rawFilePath);
+        console.log(`[${channelId}] [INCOMING] Müvəqqəti xam fayl silindi.`);
+
+    } catch (err) {
+        console.error(`[${channelId}] [INCOMING] Gələn səs yazısını yaddaşa verərkən xəta:`, err);
+    }
+}
+
+// WebSocket-ə göndərilən səs parçalarını .wav faylı kimi saxlayan funksiya
+async function saveOutgoingRecording(channelId, audioChunks) {
+    if (!audioChunks || audioChunks.length === 0) {
+        console.log(`[${channelId}] [OUTGOING] Yazmaq üçün səs datası tapılmadı.`);
+        return;
+    }
+
+    console.log(`[${channelId}] [OUTGOING] Göndərilən səs yazısı yaddaşa verilir... Toplam ${audioChunks.length} parça.`);
+    
+    try {
+        const fullAudio = Buffer.concat(audioChunks);
+        console.log(`[${channelId}] [OUTGOING] Toplam səs ölçüsü: ${fullAudio.length} bayt`);
+        
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const wavFileName = `${channelId}_OUTGOING_${timestamp}.wav`;
+        const rawFilePath = path.join(RECORDINGS_DIR, `${wavFileName}.raw`);
+        const wavFilePath = path.join(RECORDINGS_DIR, wavFileName);
+
+        // 1. Xam slin16 faylını yazırıq
+        await fsPromises.writeFile(rawFilePath, fullAudio);
+        console.log(`[${channelId}] [OUTGOING] Müvəqqəti xam fayl yazıldı: ${rawFilePath} (${fullAudio.length} bayt)`);
+
+        // 2. sox ilə WAV formatına çeviririk (slin16 16kHz -> WAV)
+        const soxCommand = `sox -t raw -r 16000 -e signed-integer -b 16 -L -c 1 "${rawFilePath}" "${wavFilePath}"`;
+        console.log(`[${channelId}] [OUTGOING] Sox əmri icra edilir: ${soxCommand}`);
+        
+        await new Promise((resolve, reject) => {
+            exec(soxCommand, (error, stdout, stderr) => {
+                if (error) {
+                    console.error(`[${channelId}] [OUTGOING] sox konvertasiya xətası: ${stderr}`);
+                    fsPromises.unlink(rawFilePath).catch(e => console.error(`[${channelId}] [OUTGOING] Müvəqqəti faylı silərkən xəta: ${e.message}`));
+                    return reject(error);
+                }
+                console.log(`[${channelId}] [OUTGOING] ✅ Göndərilən səs yazısı uğurla WAV formatına çevrildi: ${wavFilePath}`);
+                if (stdout) console.log(`[${channelId}] [OUTGOING] Sox stdout: ${stdout}`);
+                resolve(stdout);
+            });
+        });
+
+        // 3. Müvəqqəti xam faylı silirik
+        await fsPromises.unlink(rawFilePath);
+        console.log(`[${channelId}] [OUTGOING] Müvəqqəti xam fayl silindi.`);
+
+    } catch (err) {
+        console.error(`[${channelId}] [OUTGOING] Göndərilən səs yazısını yaddaşa verərkən xəta:`, err);
+    }
+}
+
+// Playback üçün nəzərdə tutulmuş səsi yoxlamaq üçün saxlayan funksiya
+async function savePlaybackDebugRecording(channelId, audioChunks) {
+    if (!audioChunks || audioChunks.length === 0) {
+        console.log(`[${channelId}] [PLAYBACK_DEBUG] Yazmaq üçün səs datası tapılmadı.`);
+        return;
+    }
+
+    console.log(`[${channelId}] [PLAYBACK_DEBUG] Səsləndiriləcək səs yaddaşa verilir... Toplam ${audioChunks.length} parça.`);
+    
+    try {
+        const fullAudio = Buffer.concat(audioChunks);
+        console.log(`[${channelId}] [PLAYBACK_DEBUG] Toplam səs ölçüsü: ${fullAudio.length} bayt`);
+        
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const wavFileName = `${channelId}_PLAYBACK_DEBUG_${timestamp}.wav`;
+        const rawFilePath = path.join(RECORDINGS_DIR, `${wavFileName}.raw`);
+        const wavFilePath = path.join(RECORDINGS_DIR, wavFileName);
+
+        // 1. Xam slin16 faylını yazırıq
+        await fsPromises.writeFile(rawFilePath, fullAudio);
+        console.log(`[${channelId}] [PLAYBACK_DEBUG] Müvəqqəti xam fayl yazıldı: ${rawFilePath} (${fullAudio.length} bayt)`);
+
+        // 2. sox ilə WAV formatına çeviririk (slin16 16kHz -> WAV)
+        const soxCommand = `sox -t raw -r 16000 -e signed-integer -b 16 -L -c 1 "${rawFilePath}" "${wavFilePath}"`;
+        console.log(`[${channelId}] [PLAYBACK_DEBUG] Sox əmri icra edilir: ${soxCommand}`);
+        
+        await new Promise((resolve, reject) => {
+            exec(soxCommand, (error, stdout, stderr) => {
+                if (error) {
+                    console.error(`[${channelId}] [PLAYBACK_DEBUG] sox konvertasiya xətası: ${stderr}`);
+                    fsPromises.unlink(rawFilePath).catch(e => console.error(`[${channelId}] [PLAYBACK_DEBUG] Müvəqqəti faylı silərkən xəta: ${e.message}`));
+                    return reject(error);
+                }
+                console.log(`[${channelId}] [PLAYBACK_DEBUG] ✅ Səsləndiriləcək səs uğurla WAV formatına çevrildi: ${wavFilePath}`);
+                if (stdout) console.log(`[${channelId}] [PLAYBACK_DEBUG] Sox stdout: ${stdout}`);
+                resolve(stdout);
+            });
+        });
+
+        // 3. Müvəqqəti xam faylı silirik
+        await fsPromises.unlink(rawFilePath);
+        console.log(`[${channelId}] [PLAYBACK_DEBUG] Müvəqqəti xam fayl silindi.`);
+
+    } catch (err) {
+        console.error(`[${channelId}] [PLAYBACK_DEBUG] Səsləndiriləcək səsi yaddaşa verərkən xəta:`, err);
+    }
+}
+
+// Hər bir aktiv zəng üçün bütün resursları saxlayan obyekt
+const callStates = new Map();
+let nextUdpPort = BASE_UDP_PORT;
+
+// Zəngə aid bütün resursları (sox, pipe, ws, kanallar) təmizləyən funksiya
+async function cleanupCallResources(channelId) {
+    if (callStates.has(channelId)) {
+        const state = callStates.get(channelId);
+        
+        console.log(`[${channelId}] [CLEANUP] Təmizləmə başlayır...`);
+        
+        // Təmizləmədən əvvəl səs yazılarını yaddaşa veririk
+        console.log(`[${channelId}] [CLEANUP] Səs yazıları saxlanılır...`);
+        await saveIncomingRecording(channelId, state.audioChunks);
+        await saveOutgoingRecording(channelId, state.outgoingAudioChunks);
+        await savePlaybackDebugRecording(channelId, state.playbackAudioChunks); // Debug faylını saxlayırıq
+        
+        console.log(`[${channelId}] Bütün resurslar təmizlənir...`);
+
+        // Davam edən səsləndirməni dayandırırıq
+        if (state.playback && !state.playback.destroyed) {
+            console.log(`[${channelId}] Təmizləmə: Playback obyektini dayandırıram...`);
+            try { await state.playback.stop(); } catch (e) { console.log(`[${channelId}] Təmizləmə: Playback dayandırarkən xəta (normaldır): ${e.message}`); }
+        }
+        // sox prosesini dayandırırıq
+        if (state.soxProcess) {
+            console.log(`[${channelId}] Təmizləmə: sox prosesini dayandırıram...`);
+            state.soxProcess.kill('SIGTERM');
+        }
+        // ulaw->slin16 konversiya prosesini dayandırırıq
+        if (state.ulawToSlinProcess) {
+            console.log(`[${channelId}] Təmizləmə: ulaw->slin16 sox prosesini dayandırıram...`);
+            state.ulawToSlinProcess.kill('SIGTERM');
+        }
+        // Yaradılmış named pipe faylını silirik
+        if (state.pipePath && fs.existsSync(state.pipePath)) {
+            console.log(`[${channelId}] Təmizləmə: Named pipe faylını (${state.pipePath}) silirəm...`);
+            fs.unlinkSync(state.pipePath);
+        }
+        // WebSocket bağlantısını bağlayırıq
+        if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+            console.log(`[${channelId}] Təmizləmə: WebSocket bağlantısını bağlayıram...`);
+            state.ws.close();
+        }
+        // External media kanalını bağlayırıq
+        if (state.externalChannel && !state.externalChannel.destroyed) {
+            console.log(`[${channelId}] Təmizləmə: External media kanalını bağlayıram...`);
+            try { await state.externalChannel.hangup(); } catch (e) { console.log(`[${channelId}] Təmizləmə: External media kanalını bağlayarkən xəta (normaldır): ${e.message}`); }
+        }
+        // UDP serveri dayandırırıq
+        if (state.udpServer) {
+            console.log(`[${channelId}] Təmizləmə: UDP serverini bağlayıram...`);
+            state.udpServer.close();
+        }
+        
+        callStates.delete(channelId);
+        console.log(`[${channelId}] Resurslar uğurla təmizləndi.`);
+    } else {
+        console.log(`[${channelId}] Təmizləmə: Bu kanal üçün heç bir resurs tapılmadı (artıq təmizlənib).`);
+    }
+}
+
+// Əsas ARI məntiqi
+async function main() {
+    try {
+        setupSounds();
+        setupRecordings();
+
+        const client = await ariClient.connect(ASTERISK_URL, ASTERISK_USERNAME, ASTERISK_PASSWORD);
+        console.log(`[${new Date().toISOString()}]`,'✅ ARI-yə uğurla qoşuldu.');
+
+        client.on('StasisStart', async (event, channel) => {
+            // Daxili yaradılmış virtual kanalların (Local/ və UnicastRTP/) bütün prosesi yenidən başlatmasının qarşısını alırıq.
+            if (channel.name.startsWith('Local/') || channel.name.startsWith('UnicastRTP/')) {
+                console.log(`[${new Date().toISOString()}]`,`[${channel.id}] 📞 Virtual kanal (${channel.name}) ignorer edildi.`);
+                return;
+            }
+            
+            const channelId = channel.id;
+            console.log(`[${new Date().toISOString()}]`,`📞 Yeni zəng qəbul edildi: ${channelId}, Ad: ${channel.name}, Nömrə: ${channel.caller.number}`);
+            
+            const udpPort = nextUdpPort++;
+            console.log(`[${channelId}] Resurslar hazırlanır: UDP Port=${udpPort}, WebSocket URL=${WEBSOCKET_URL}`);
+            const ws = new WebSocket(WEBSOCKET_URL);
+            const udpServer = dgram.createSocket('udp4');
+            
+            // Zəngin bütün vəziyyətini bir yerdə saxlayırıq (səs parçalarını toplamaq üçün boş array ilə)
+            callStates.set(channelId, { 
+                channel, 
+                ws, 
+                udpServer, 
+                udpPort, 
+                audioChunks: [],           // Gələn ulaw səs parçaları
+                outgoingAudioChunks: [],   // WebSocket-ə göndərilən slin16 səs parçaları
+                playbackAudioChunks: [],   // Debug: Səsləndiriləcək slin16 səs parçaları
+                ulawToSlinProcess: null 
+            });
+            console.log(`[${channelId}] Vəziyyət (state) yaradıldı və callStates-ə əlavə edildi.`);
+
+            try {
+                console.log(`[${channelId}] Zəngə cavab verməyə çalışıram...`);
+                await channel.answer();
+                console.log(`[${channelId}] 📢 Zəngə uğurla cavab verildi.`);
+                
+                udpServer.on('message', (msg) => {
+                    const state = callStates.get(channelId);
+                    if (!state || !state.ws) {
+                        console.warn(`[${channelId}] UDP mesajı gəldi, amma WebSocket mövcud deyil. İgnorer edilir.`);
+                        return;
+                    }
+
+                    // RTP başlığını kəsirik (12 bayt)
+                    const audioChunk = msg.slice(12);
+                    
+                    // Səs parçasını daha sonra saxlamaq üçün toplayırıq (ulaw formatında)
+                    state.audioChunks.push(audioChunk);
+
+                    // ulaw səsi sox prosesinə göndəririk konversiya üçün
+                    if (state.ulawToSlinProcess && !state.ulawToSlinProcess.killed) {
+                        state.ulawToSlinProcess.stdin.write(audioChunk);
+                        console.log(`[${channelId}] [UDP->SOX] ${audioChunk.length} bayt ulaw səs sox prosesinə yazıldı`);
+                    } else {
+                        console.warn(`[${channelId}] UDP mesajı gəldi, amma ulaw->slin16 konversiya prosesi aktiv deyil.`);
+                    }
+                });
+
+                udpServer.on('error', (err) => {
+                    console.error(`[${channelId}] UDP Server xətası (port ${udpPort}):\n${err.stack}`);
+                    udpServer.close();
+                });
+
+                console.log(`[${channelId}] UDP serverini ${udpPort} portuna bağlamağa çalışıram...`);
+                await new Promise(resolve => udpServer.bind(udpPort, '127.0.0.1', resolve));
+                console.log(`[${channelId}] 🎧 UDP server ${udpPort} portunda səsləri uğurla dinləyir.`);
+
+                ws.on('open', async () => {
+                    console.log(`[${channelId}] ✅ WebSocket-a uğurla qoşuldu.`);
+                    const state = callStates.get(channelId);
+                    if (!state) {
+                        console.warn(`[${channelId}] WebSocket açıldı, amma zəng vəziyyəti artıq mövcud deyil. Bağlantı bağlanır.`);
+                        ws.close();
+                        return;
+                    }
+
+                    // ulaw-dan slin16-ya konversiya üçün sox prosesi yaradırıq
+                    console.log(`[${channelId}] ulaw->slin16 konversiya prosesi başladılır...`);
+                    const ulawToSlinProcess = spawn('sox', [
+                        '-t', 'ul', '-r', '8000', '-c', '1', '-',  // INPUT: ulaw 8kHz
+                        '-t', 'raw', '-r', '16000', '-e', 'signed-integer', '-b', '16', '-L', '-c', '1', '-'  // OUTPUT: slin16 16kHz
+                    ]);
+                    
+                    state.ulawToSlinProcess = ulawToSlinProcess;
+                    
+                    // Konversiya edilmiş səsi WebSocket-ə göndəririk
+                    ulawToSlinProcess.stdout.on('data', (convertedData) => {
+                        console.log(`[${channelId}] [CONVERSION] Sox-dan ${convertedData.length} bayt konversiya edilmiş data alındı`);
+                        
+                        if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+                            // Konversiya edilmiş səsi də toplayırıq
+                            state.outgoingAudioChunks.push(convertedData);
+                            console.log(`[${channelId}] [OUTGOING] Konversiya edilmiş səs toplandı. Cari parça sayı: ${state.outgoingAudioChunks.length}`);
+                            
+                            const arrayBuffer = convertedData.buffer.slice(
+                                convertedData.byteOffset,
+                                convertedData.byteOffset + convertedData.byteLength
+                            );
+                            state.ws.send(arrayBuffer);
+                            console.log(`[${channelId}] ➡️  ${arrayBuffer.byteLength} bayt konversiya edilmiş səs (slin16) backend-ə göndərildi.`);
+                        } else {
+                            console.warn(`[${channelId}] [CONVERSION] Konversiya edilmiş data var, amma WebSocket hazır deyil`);
+                        }
+                    });
+                    
+                    ulawToSlinProcess.stderr.on('data', (data) => {
+                        console.error(`[${channelId}] ulaw->slin16 sox XƏTA: ${data}`);
+                    });
+                    
+                    ulawToSlinProcess.on('exit', (code) => {
+                        console.log(`[${channelId}] ulaw->slin16 sox prosesi dayandı. Çıxış kodu: ${code}`);
+                    });
+
+                    console.log(`[${channelId}] Səs axını üçün external media kanalı yaradılır...`);
+                    const externalChannel = client.Channel();
+                    state.externalChannel = externalChannel;
+
+                    // VACIB: Asterisk-dən ulaw formatında səs istəyirik
+                    // Çünki SIPStation ulaw/alaw istifadə edir və Asterisk slin16-ya konversiya edə bilmir
+                    const requestedFormat = 'ulaw'; // 'slin16' əvəzinə 'ulaw' istəyirik
+                    console.log(`[${channelId}] Asterisk-dən səs axınını '${requestedFormat}' formatında istəyirəm...`);
+
+                    await externalChannel.externalMedia({
+                        app: ARI_APP_NAME,
+                        external_host: `127.0.0.1:${udpPort}`,
+                        format: requestedFormat
+                    });
+                    console.log(`[${channelId}] ✅ External media kanalı uğurla yaradıldı.`);
+                    
+                    console.log(`[${channelId}] Zəngi və external media kanalını körpüləmək üçün bridge yaradılır...`);
+                    const bridge = client.Bridge();
+                    await bridge.create({ type: 'mixing' });
+                    console.log(`[${channelId}] ✅ Bridge uğurla yaradıldı.`);
+
+                    console.log(`[${channelId}] Kanallar bridge-ə əlavə edilir...`);
+                    await bridge.addChannel({ channel: [channelId, externalChannel.id] });
+                    console.log(`[${channelId}] ✅ Zəng və external media kanalı körpüləndi. Səs axını başladı.`);
+                });
+
+                ws.on('message', async (data) => {
+                    console.log(`[${channelId}] 📩 WebSocket-dan yeni mesaj qəbul edildi.`);
+                    const state = callStates.get(channelId);
+                    if (!state) {
+                        console.warn(`[${channelId}] WebSocket mesajı gəldi, lakin zəng vəziyyəti mövcud deyil. İgnorer edilir.`);
+                        return; // Zəng bitibsə mesajı ignorer edirik
+                    }
+
+                    try {
+                        const message = JSON.parse(data);
+                        console.log(`[${channelId}] Mesaj emal edilir, Tipi: ${message.type}`);
+                        
+                        // Mesajın tipini yoxlayırıq (index.tsx-ə uyğun olaraq)
+                        if (message.type === 'gemini') {
+                            const geminiMessage = message.data;
+                            console.log(`[${channelId}] [GEMINI] Mesaj qəbul edildi:`, JSON.stringify(geminiMessage));
+
+                            if (geminiMessage.serverContent?.interrupted) {
+                                console.log(`[${channelId}] [GEMINI] 🛑 Servisdən 'interrupted' siqnalı gəldi. Səs axını dayandırılır.`);
+                                if (state.playback) {
+                                    console.log(`[${channelId}] [GEMINI] Mövcud səsləndirmə dayandırılır...`);
+                                    await state.playback.stop();
+                                } else {
+                                    console.log(`[${channelId}] [GEMINI] 'interrupted' siqnalı gəldi, amma aktiv səsləndirmə yoxdur.`);
+                                }
+                                return;
+                            }
+    
+                            const audioDataBase64 = geminiMessage.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
+                            const isComplete = geminiMessage.serverContent?.generationComplete === true;
+
+                            if (audioDataBase64) {
+                                console.log(`[${channelId}] [GEMINI] Mesajda ${audioDataBase64.length} simvol uzunluğunda base64 səs datası tapıldı.`);
+                                const audioBuffer = Buffer.from(audioDataBase64, 'base64');
+                                
+                                // Aktiv səs axını yoxdursa, yenisini yaradırıq
+                                if (!state.soxProcess) {
+                                    console.log(`[${channelId}] [PLAYBACK] 🎶 Yeni səs axını üçün resurslar hazırlanır...`);
+                                    const pipePath = path.join(SOUNDS_DIR, `playback_${channelId}.sln16`);
+                                    if (fs.existsSync(pipePath)) {
+                                        console.warn(`[${channelId}] [PLAYBACK] Köhnə pipe faylı (${pipePath}) tapıldı və silinir.`);
+                                        fs.unlinkSync(pipePath);
+                                    }
+                                    console.log(`[${channelId}] [PLAYBACK] Named pipe yaradılır: ${pipePath}`);
+                                    execSync(`mkfifo ${pipePath}`);
+                                    
+                                    console.log(`[${channelId}] [PLAYBACK] sox prosesi başladılır... (24kHz -> 16kHz)`);
+                                    const soxProcess = spawn('sox', [
+                                        '-t', 'raw', '-r', '24000', '-e', 'signed-integer', '-b', '16', '-L', '-c', '1', '-', // INPUT: Gemini-dən gələn səs
+                                        '-t', 'raw', '-r', '16000', '-e', 'signed-integer', '-b', '16', '-L', '-c', '1', pipePath  // OUTPUT: named pipe
+                                    ]);
+                                    
+                                    soxProcess.stderr.on('data', (data) => console.error(`[${channelId}] [PLAYBACK] sox XƏTA: ${data}`));
+                                    soxProcess.on('exit', (code) => console.log(`[${channelId}] [PLAYBACK] sox prosesi dayandı. Çıxış kodu: ${code}`));
+    
+                                    // DEBUG: Sox-un çıxışını da toplayırıq
+                                    soxProcess.stdout.on('data', (playbackData) => {
+                                        state.playbackAudioChunks.push(playbackData);
+                                    });
+
+                                    const playback = client.Playback();
+                                    state.pipePath = pipePath;
+                                    state.soxProcess = soxProcess;
+                                    state.playback = playback;
+                                    
+                                    // VACIB: Pipe-a əvvəlcədən kiçik bir səssizlik yazırıq ki, Asterisk açanda boş olmasın
+                                    console.log(`[${channelId}] [PLAYBACK] Pipe-a başlanğıc səssizlik yazılır...`);
+                                    const silenceBuffer = Buffer.alloc(1600, 0); // 100ms səssizlik (16kHz, 16-bit = 1600 bayt)
+                                    
+                                    // Pipe-ı açıb səssizliyi yazırıq
+                                    const pipeWriter = fs.createWriteStream(pipePath, { flags: 'a' });
+                                    pipeWriter.write(silenceBuffer);
+                                    
+                                    // Kiçik bir gecikmədən sonra Asterisk-ə playback əmri veririk
+                                    setTimeout(async () => {
+                                        console.log(`[${channelId}] [PLAYBACK] Asterisk-ə səsləndirmə üçün müraciət edilir (sound:${path.basename(pipePath, '.sln16')})...`);
+                                        try {
+                                            await channel.play({ media: `sound:${path.basename(pipePath, '.sln16')}`, playbackId: playback.id });
+                                            console.log(`[${channelId}] [PLAYBACK] Səsləndirmə uğurla başladıldı.`);
+                                        } catch (err) {
+                                            console.log(`[${channelId}] [PLAYBACK] Səsləndirmə xətası: ${err.message}`);
+                                            // Xəta baş versə resursları təmizləyirik
+                                            if(state.soxProcess && !state.soxProcess.killed) state.soxProcess.kill();
+                                            if(fs.existsSync(state.pipePath)) fs.unlinkSync(state.pipePath);
+                                            state.soxProcess = null;
+                                            state.pipePath = null;
+                                            state.playback = null;
+                                        }
+                                    }, 50); // 50ms gecikmə
+                                }
+                                
+                                // Audio parçasını aktiv sox prosesinə yazırıq
+                                if (state.soxProcess && !state.soxProcess.killed) {
+                                    console.log(`[${channelId}] [PLAYBACK] ⬇️  ${audioBuffer.length} bayt səs datası sox prosesinə yazılır.`);
+                                    state.soxProcess.stdin.write(audioBuffer);
+                                } else {
+                                    console.warn(`[${channelId}] [PLAYBACK] Səs datası gəldi, amma sox prosesi aktiv deyil. Data ignorer edildi.`);
+                                }
+                            }
+
+                            // Səs axını bitibsə, sox prosesinin girişini bağlayırıq.
+                            if (isComplete) {
+                                console.log(`[${channelId}] [GEMINI] ✅ Servisdən 'generationComplete' siqnalı gəldi.`);
+                                if (state.soxProcess && !state.soxProcess.killed) {
+                                    console.log(`[${channelId}] [PLAYBACK] Bütün səs datası göndərildi. Sox prosesinin stdin axını bağlanır.`);
+                                    state.soxProcess.stdin.end();
+                                    
+                                    // Playback bitdikdə resursları təmizləmək üçün dinləyici əlavə edirik
+                                    if (state.playback) {
+                                        state.playback.once('PlaybackFinished', () => {
+                                            console.log(`[${channelId}] [PLAYBACK] Səsləndirmə tamamlandı. Resurslar təmizlənir.`);
+                                            if(state.soxProcess && !state.soxProcess.killed) state.soxProcess.kill();
+                                            if(fs.existsSync(state.pipePath)) fs.unlinkSync(state.pipePath);
+                                            state.soxProcess = null;
+                                            state.pipePath = null;
+                                            state.playback = null;
+                                        });
+                                    }
+                                } else {
+                                    console.log(`[${channelId}] [GEMINI] 'generationComplete' siqnalı gəldi, amma aktiv sox prosesi yoxdur (bəlkə də heç səs gəlmədi).`);
+                                }
+                            }
+                            
+                        } else if (message.type === 'status') {
+                            console.log(`[${channelId}] Servisdən status mesajı:`, message.data);
+                        } else if (message.type === 'error') {
+                            console.error(`[${channelId}] Servisdən xəta mesajı:`, message.data);
+                        }
+
+                    } catch (e) {
+                        console.error(`[${channelId}] WebSocket-dan gələn mesajı emal edərkən xəta:`, e.message);
+                    }
+                });
+
+                ws.on('close', async () => {
+                    console.log(`[${channelId}] WebSocket bağlantısı bağlandı. Zəngin bitirilməsi yoxlanılır...`);
+                    const state = callStates.get(channelId);
+                    // Əgər vəziyyət artıq yoxdursa və ya təmizləmə prosesi başlayıbsa, heç nə etmə.
+                    if (!state || state.isCleaningUp) {
+                        console.log(`[${channelId}] WebSocket bağlantısı bağlandı (gözlənilən).`);
+                        return;
+                    }
+
+                    console.log(`[${channelId}] WebSocket bağlantısı GÖZLƏNİLMƏDƏN bağlandı. Zəng bitirilir...`);
+                    if (channel && !channel.destroyed) {
+                        try { await channel.hangup(); } catch (e) { console.error(`[${channelId}] Zəngi bitirərkən xəta (ws close): ${e.message}`); }
+                    }
+                });
+
+                ws.on('error', async (err) => {
+                    console.log(`[${channelId}] WebSocket xətası:`, err.message);
+                    const state = callStates.get(channelId);
+                    // Əgər vəziyyət artıq yoxdursa və ya təmizləmə prosesi başlayıbsa, heç nə etmə.
+                    if (!state || state.isCleaningUp) {
+                        console.error(`[${channelId}] ❌ WebSocket xətası (təmizləmə zamanı):`, err.message);
+                        return;
+                    }
+
+                    console.error(`[${channelId}] ❌ WebSocket xətası:`, err.message);
+                    if (channel && !channel.destroyed) {
+                        console.log(`[${channelId}] Xəta səbəbi ilə zəng aktivdir, bitirilir...`);
+                        try { await channel.hangup(); } catch (e) { console.error(`[${channelId}] Zəngi bitirərkən xəta (ws error): ${e.message}`); }
+                    }
+                });
+
+            } catch (err) {
+                console.error(`❌ Kanal ${channelId} üçün əsas 'try' blokunda kritik xəta:`, err.message);
+                await cleanupCallResources(channelId);
+                if (!channel.destroyed) {
+                    console.log(`[${channelId}] Kritik xəta sonrası zəng bitirilir...`);
+                    try { await channel.hangup(); } catch (e) { console.error(`[${channelId}] Zəngi bitirərkən xəta (main catch): ${e.message}`); }
+                }
+            }
+        });
+
+        client.on('StasisEnd', async (event, channel) => {
+            console.log(`📴 Zəng bitirildi (StasisEnd hadisəsi): ${channel.id}`);
+            // Təmizləmə prosesinin başladığını qeyd edirik ki, ws.on('close') təkrar əməliyyat etməsin.
+            const state = callStates.get(channel.id);
+            if (state) {
+                state.isCleaningUp = true;
+            }
+            await cleanupCallResources(channel.id);
+        });
+
+        await client.start(ARI_APP_NAME);
+        console.log(`👂 '${ARI_APP_NAME}' tətbiqi üçün zənglər gözlənilir...`);
+
+    } catch (err) {
+        console.error('❌ ARI-yə qoşularkən kritik xəta baş verdi:', err.message);
+        console.error('💡 Yoxlayın: FreePBX-də ARI aktivdirmi? İstifadəçi adı/parol düzgündürmü?');
+    }
+}
+
+main();
