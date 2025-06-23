@@ -441,7 +441,7 @@ async function main() {
                         // Mesajın tipini yoxlayırıq (index.tsx-ə uyğun olaraq)
                         if (message.type === 'gemini') {
                             const geminiMessage = message.data;
-                            console.log(`[${channelId}] [GEMINI] Mesaj qəbul edildi:`, JSON.stringify(geminiMessage));
+                            console.log(`[${channelId}] [GEMINI] Mesaj qəbul edildi:`);
 
                             if (geminiMessage.serverContent?.interrupted) {
                                 console.log(`[${channelId}] [GEMINI] 🛑 Servisdən 'interrupted' siqnalı gəldi. Səs axını dayandırılır.`);
