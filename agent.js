@@ -25,6 +25,7 @@ const RTP_MIN_BUFFER_SIZE = (RTP_SAMPLE_RATE / 1000) * RTP_MIN_DURATION_MS * RTP
 // Sox processes for audio conversion
 let soxUpsampler = null; // 8kHz -> 16kHz for Gemini input
 let soxDownsampler = null; // 24kHz -> 8kHz for Asterisk output
+let soxFileSaver = null;
 
 function createRTPHeader() {
     const header = Buffer.alloc(12);
@@ -37,7 +38,7 @@ function createRTPHeader() {
 }
 
 // Initialize Sox processes
-function initializeSoxProcesses() {
+function initializeSoxProcesses(callId) {
     // Upsampler: 8kHz alaw -> 16kHz raw PCM for Gemini
     soxUpsampler = spawn('sox', [
         '-t', 'raw',           // Input type: raw
@@ -70,6 +71,28 @@ function initializeSoxProcesses() {
         '-'                    // Output to stdout
     ]);
 
+    // File saver for downsampled audio
+    const wavFilePath = `./playback_downsampled_${callId}_${Date.now()}.wav`;
+    soxFileSaver = spawn('sox', [
+        '-t', 'raw',           // Input type: raw
+        '-r', '8000',          // Input sample rate: 8kHz
+        '-e', 'a-law',         // Input encoding: A-law
+        '-b', '8',             // Input bits per sample: 8
+        '-c', '1',             // Input channels: mono
+        '-',                   // Input from stdin
+        '-t', 'wav',           // Output type: wav
+        wavFilePath            // Output file path
+    ]);
+    console.log(`[AIAgentBackend]: Saving downsampled audio to ${wavFilePath}`);
+
+    soxFileSaver.stderr.on('data', (data) => {
+        console.error(`[Sox FileSaver Error]: ${data}`);
+    });
+
+    soxFileSaver.on('error', (error) => {
+        console.error(`[Sox FileSaver]: Process error: ${error.message}`);
+    });
+
     console.log('[AIAgentBackend]: Sox processes initialized');
 
     // Handle upsampler errors
@@ -100,6 +123,10 @@ function cleanupSoxProcesses() {
     if (soxDownsampler) {
         soxDownsampler.kill('SIGTERM');
         soxDownsampler = null;
+    }
+    if (soxFileSaver) {
+        soxFileSaver.kill('SIGTERM');
+        soxFileSaver = null;
     }
     console.log('[AIAgentBackend]: Sox processes cleaned up');
 }
@@ -162,7 +189,7 @@ let isWebSocketReady = false;
     console.log(`[AIAgentBackend]: Incoming RTP socket: ${incomingRtpAddress}, port: ${incomingRtpPort}`);
 
     // Initialize Sox processes
-    initializeSoxProcesses();
+    initializeSoxProcesses(callId);
 
     const WEBSOCKET_URL = 'ws://localhost:3001';
     const ws = new WebSocket(WEBSOCKET_URL);    
@@ -242,6 +269,11 @@ let isWebSocketReady = false;
 
     // Setup Sox downsampler output handler (24kHz -> 8kHz for Asterisk)
     soxDownsampler.stdout.on('data', (data) => {
+        // Save the downsampled audio chunk to a file
+        if (soxFileSaver && soxFileSaver.stdin.writable) {
+            soxFileSaver.stdin.write(data);
+        }
+
         // Convert downsampled alaw data to RTP packets
         const chunkSize = 160; // 20ms for G.711 at 8kHz
         let offset = 0;
