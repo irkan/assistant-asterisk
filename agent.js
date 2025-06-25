@@ -272,10 +272,14 @@ let isWebSocketReady = false;
 
     ws.on('message', async (message) => {
         const data = JSON.parse(message);
-        console.log(`[AIAgentBackend]: Message received: isWebSocketReady ${isWebSocketReady}, ${JSON.stringify(data)}`);
         switch (data.type) {
             case 'gemini':
                 const geminiMessage = data.data;
+                if (geminiMessage.serverContent?.interrupted) {
+                    console.log('[AIAgentBackend]: Received an interrupt. Clearing audio buffer. length:' + rtpBuffer.length);
+                    rtpBuffer.length = 0;
+                    return;
+                }
                 const audioBase64 = geminiMessage.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
                 if(!audioBase64){
                     console.log(`[AIAgentBackend]: No audio data received from Gemini`);
@@ -317,7 +321,7 @@ let isWebSocketReady = false;
 
     // Handle incoming RTP data from Asterisk (8kHz alaw)
     rtpSocketSnoop.on('message', (msg) => {
-        console.log(`[AIAgentBackend]: RTP data received from Snoop RTP socket (${msg.length} bytes)`);
+        // console.log(`[AIAgentBackend]: RTP data received from Snoop RTP socket (${msg.length} bytes)`);
 
         // Extract audio payload (skip 12-byte RTP header) - this is 8kHz alaw
         const audioPayload = msg.slice(12);
@@ -328,7 +332,7 @@ let isWebSocketReady = false;
                 if (err) {
                     console.error(`[AIAgentBackend]: Error writing to Sox upsampler: ${err.message}`);
                 } else {
-                    console.log(`[AIAgentBackend]: Audio payload sent to Sox upsampler (${audioPayload.length} bytes)`);
+                    // console.log(`[AIAgentBackend]: Audio payload sent to Sox upsampler (${audioPayload.length} bytes)`);
                 }
             });
         }
